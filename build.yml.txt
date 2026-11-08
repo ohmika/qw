@@ -1,0 +1,122 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Find the project
+        id: find
+        run: |
+          shallowest() { awk -F/ '{print NF, $0}' | sort -n | head -n1 | cut -d' ' -f2-; }
+          BASE=.
+          NEWEST=""; NEWEST_T=-1
+          for z in ./*.zip; do
+            [ -f "$z" ] || continue
+            t=$(git log -1 --format=%ct -- "$z" 2>/dev/null || echo 0)
+            if [ "${t:-0}" -ge "$NEWEST_T" ]; then NEWEST="$z"; NEWEST_T="${t:-0}"; fi
+          done
+          if [ -n "$NEWEST" ]; then
+            echo "Using $NEWEST"
+            rm -rf _project
+            mkdir _project
+            unzip -q -o "$NEWEST" -d _project
+            BASE=_project
+          fi
+          rm -rf "$BASE/__MACOSX"
+          GS=$(find "$BASE" -maxdepth 5 \( -name settings.gradle -o -name settings.gradle.kts \) | shallowest)
+          PS=$(find "$BASE" -maxdepth 5 -name build-plain.sh | shallowest)
+          if [ -n "$GS" ]; then
+            DIR=$(dirname "$GS")
+            echo "type=gradle" >> "$GITHUB_OUTPUT"
+            echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+            if [ -f "$DIR/gradlew" ] && [ -f "$DIR/gradle/wrapper/gradle-wrapper.jar" ]; then
+              echo "wrapper=yes" >> "$GITHUB_OUTPUT"
+            else
+              echo "wrapper=no" >> "$GITHUB_OUTPUT"
+            fi
+          elif [ -n "$PS" ]; then
+            echo "type=plain" >> "$GITHUB_OUTPUT"
+            echo "dir=$(dirname "$PS")" >> "$GITHUB_OUTPUT"
+            echo "wrapper=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::No Android project found. Upload the project zip prepared by GitHub Build Prep to this repository."
+            exit 1
+          fi
+
+      - name: Accept Android SDK licenses
+        run: |
+          SM="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SM" ]; then yes | "$SM" --licenses > /dev/null || true; fi
+
+      - name: Set up Gradle (the project has no usable wrapper)
+        if: steps.find.outputs.type == 'gradle' && steps.find.outputs.wrapper == 'no'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Use the stable signing key
+        run: |
+          K=$(find "${{ steps.find.outputs.dir }}" -maxdepth 3 -path '*/.github/debug.keystore' | head -n1)
+          if [ -n "$K" ]; then
+            mkdir -p ~/.android
+            cp "$K" ~/.android/debug.keystore
+            echo "Using the key from the project"
+          fi
+
+      - name: Build
+        working-directory: ${{ steps.find.outputs.dir }}
+        run: |
+          if [ "${{ steps.find.outputs.type }}" = "gradle" ]; then
+            if [ "${{ steps.find.outputs.wrapper }}" = "yes" ]; then
+              chmod +x gradlew
+              ./gradlew --no-daemon assembleDebug --stacktrace
+            else
+              gradle --no-daemon assembleDebug --stacktrace
+            fi
+          else
+            chmod +x build-plain.sh
+            ./build-plain.sh
+          fi
+
+      - name: Collect the APKs
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          D="${{ steps.find.outputs.dir }}"
+          if [ "${{ steps.find.outputs.type }}" = "gradle" ]; then
+            find "$D" -path '*/build/outputs/apk/debug/*.apk' -exec cp {} "$GITHUB_WORKSPACE/out/" \;
+          else
+            cp "$D"/out/*.apk "$GITHUB_WORKSPACE/out/"
+          fi
+          ls -l "$GITHUB_WORKSPACE/out"
+          test -n "$(ls "$GITHUB_WORKSPACE"/out/*.apk 2>/dev/null)"
+
+      - name: Keep the APKs as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: out/*.apk
+
+      - name: Publish the APKs as a release (easy download on a phone)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" out/*.apk \
+            --title "Build ${{ github.run_number }}" \
+            --notes "Built from commit ${GITHUB_SHA::7}" \
+            || gh release upload "build-${{ github.run_number }}" out/*.apk --clobber
